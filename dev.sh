@@ -1,5 +1,8 @@
 #!/bin/bash
 
-source ./dev-env/bin/activate
+# Activate the virtual environment
+source ./dev-venv/bin/activate
 
-python3 src/video_inference_ncnn.py --headless
+# Run the video inference script from src directory
+# Pass all arguments through, with --headless as default for server environments
+cd src && python video_inference_ncnn.py

@@ -6,11 +6,13 @@ YOLO video inference script using NCNN model with Ultralytics
 This script loads a YOLO11n model in NCNN format and runs inference on a video file.
 Usage:
     python video_inference_ncnn.py [--headless] [--model MODEL_PATH] [--video VIDEO_PATH] [--output OUTPUT_PATH]
+    [--enhance] [--temporal] [--conf CONFIDENCE]
 
 Examples:
     python video_inference_ncnn.py                          # Interactive mode with GUI
     python video_inference_ncnn.py --headless                # Headless mode (no GUI)
     python video_inference_ncnn.py --video sample_vids/8170-207209141_small.mp4
+    python video_inference_ncnn.py --headless --enhance --temporal  # Both improvements enabled
 """
 
 import os
@@ -19,6 +21,7 @@ import time
 import argparse
 import cv2
 import numpy as np
+from collections import defaultdict
 from ultralytics import YOLO
 
 # Default paths - easily configurable
@@ -32,14 +35,177 @@ BBOX_COLORS = [
     (96, 202, 231), (159, 124, 168), (169, 162, 241), (98, 118, 150), (172, 176, 184)
 ]
 
-# Detection parameters
-CONFIDENCE_THRESHOLD = 0.5
+# Default detection parameters
+DEFAULT_CONFIDENCE_THRESHOLD = 0.5
+
+
+class TemporalSmoother:
+    """Track detections across frames to improve consistency."""
+    
+    def __init__(self, max_frames=5, iou_threshold=0.5):
+        """
+        Initialize the temporal smoother.
+        
+        Args:
+            max_frames: Maximum number of frames to track a detection without updates
+            iou_threshold: IOU threshold to consider detections as the same object
+        """
+        self.tracks = defaultdict(list)  # class_id -> list of track dicts
+        self.max_frames = max_frames
+        self.iou_threshold = iou_threshold
+        self.current_frame = 0
+    
+    def calculate_iou(self, box1, box2):
+        """Calculate Intersection over Union (IOU) between two boxes."""
+        x1, y1, x2, y2 = box1
+        fx1, fy1, fx2, fy2 = box2
+        
+        inter_x1 = max(x1, fx1)
+        inter_y1 = max(y1, fy1)
+        inter_x2 = min(x2, fx2)
+        inter_y2 = min(y2, fy2)
+        
+        inter_area = max(0, inter_x2 - inter_x1) * max(0, inter_y2 - inter_y1)
+        
+        area1 = (x2 - x1) * (y2 - y1)
+        area2 = (fx2 - fx1) * (fy2 - fy1)
+        union_area = area1 + area2 - inter_area
+        
+        return inter_area / union_area if union_area > 0 else 0
+    
+    def update(self, detections, frame_count):
+        """
+        Update tracker with current frame detections.
+        
+        Args:
+            detections: List of detection dicts with 'xyxy', 'conf', 'cls', 'classname'
+            frame_count: Current frame number
+        
+        Returns:
+            List of smoothed detections
+        """
+        self.current_frame = frame_count
+        
+        # For each class, match current detections with existing tracks
+        for classidx, tracks in list(self.tracks.items()):
+            current_class_dets = [d for d in detections if d['cls'] == classidx]
+            
+            for track in tracks:
+                best_match_idx = None
+                best_iou = 0
+                
+                for i, det in enumerate(current_class_dets):
+                    iou = self.calculate_iou(track['xyxy'], det['xyxy'])
+                    if iou > best_iou and iou > self.iou_threshold:
+                        best_iou = iou
+                        best_match_idx = i
+                
+                if best_match_idx is not None:
+                    # Update track with matched detection
+                    matched_det = current_class_dets[best_match_idx]
+                    track['xyxy'] = matched_det['xyxy']
+                    track['conf'] = matched_det['conf']
+                    track['frame'] = frame_count
+                    track['classname'] = matched_det['classname']
+                    # Mark as matched
+                    current_class_dets[best_match_idx]['_matched'] = True
+            
+            # Add unmatched detections as new tracks
+            for det in current_class_dets:
+                if not det.get('_matched', False):
+                    self.tracks[classidx].append({
+                        'xyxy': det['xyxy'],
+                        'conf': det['conf'],
+                        'cls': det['cls'],
+                        'classname': det['classname'],
+                        'frame': frame_count
+                    })
+            
+            # Remove old tracks (no updates for max_frames)
+            self.tracks[classidx] = [
+                t for t in self.tracks[classidx] 
+                if frame_count - t['frame'] <= self.max_frames
+            ]
+        
+        # Return all current active tracks as smoothed detections
+        smoothed_detections = []
+        for classidx, tracks in self.tracks.items():
+            for track in tracks:
+                smoothed_detections.append({
+                    'xyxy': track['xyxy'],
+                    'conf': track['conf'],
+                    'cls': track['cls'],
+                    'classname': track['classname']
+                })
+        
+        return smoothed_detections
+    
+    def get_active_tracks(self):
+        """Get all currently active tracks."""
+        all_tracks = []
+        for classidx, tracks in self.tracks.items():
+            all_tracks.extend(tracks)
+        return all_tracks
+
+
+def enhance_frame(frame, clip_limit=2.0, tile_size=(8, 8)):
+    """
+    Apply image enhancement to improve detection quality.
+    
+    Uses CLAHE (Contrast Limited Adaptive Histogram Equalization) for contrast
+    enhancement and unsharp masking for sharpening.
+    
+    Args:
+        frame: Input BGR frame
+        clip_limit: CLAHE clip limit (higher = more contrast)
+        tile_size: CLAHE grid size
+    
+    Returns:
+        Enhanced BGR frame
+    """
+    # Convert to LAB color space for better contrast manipulation
+    lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    
+    # Apply CLAHE to the L channel (luminance)
+    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_size)
+    cl = clahe.apply(l)
+    
+    # Merge channels and convert back to BGR
+    limg = cv2.merge((cl, a, b))
+    enhanced = cv2.cvtColor(limg, cv2.COLOR_LAB2BGR)
+    
+    # Apply sharpening using unsharp masking
+    blurred = cv2.GaussianBlur(enhanced, (0, 0), 3)
+    sharpened = cv2.addWeighted(enhanced, 1.5, blurred, -0.5, 0)
+    
+    return sharpened
+
+
+def draw_detection(frame, xyxy, classname, conf, color):
+    """Draw a single detection on the frame."""
+    xmin, ymin, xmax, ymax = xyxy.astype(int)
+    
+    # Draw bounding box
+    cv2.rectangle(frame, (xmin, ymin), (xmax, ymax), color, 2)
+    
+    # Draw label
+    label = f'{classname}: {int(conf*100)}%'
+    labelSize, baseLine = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+    label_ymin = max(ymin, labelSize[1] + 10)
+    
+    # Draw label background
+    cv2.rectangle(frame, (xmin, label_ymin-labelSize[1]-10), 
+                (xmin+labelSize[0], label_ymin+baseLine-10), color, cv2.FILLED)
+    # Draw label text
+    cv2.putText(frame, label, (xmin, label_ymin-7), 
+              cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
 
 
 def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
-        description='Run YOLO11n NCNN model inference on video files'
+        description='Run YOLO11n NCNN model inference on video files with improvements'
     )
     
     parser.add_argument(
@@ -69,6 +235,25 @@ def parse_args():
         help=f'Path to the output video file (default: {DEFAULT_OUTPUT_PATH})'
     )
     
+    parser.add_argument(
+        '--enhance',
+        action='store_true',
+        help='Enable image enhancement (CLAHE + sharpening) for better detection'
+    )
+    
+    parser.add_argument(
+        '--temporal',
+        action='store_true',
+        help='Enable temporal smoothing to track detections across frames'
+    )
+    
+    parser.add_argument(
+        '--conf',
+        type=float,
+        default=DEFAULT_CONFIDENCE_THRESHOLD,
+        help=f'Confidence threshold for detections (default: {DEFAULT_CONFIDENCE_THRESHOLD})'
+    )
+    
     return parser.parse_args()
 
 
@@ -82,11 +267,21 @@ def main():
     VIDEO_PATH = args.video
     OUTPUT_PATH = args.output
     HEADLESS = args.headless
+    ENABLE_ENHANCE = args.enhance
+    ENABLE_TEMPORAL = args.temporal
+    CONFIDENCE_THRESHOLD = args.conf
     
     print("=" * 60)
-    print("YOLO11n NCNN Video Inference")
+    print("YOLO11n NCNN Video Inference with Improvements")
     if HEADLESS:
         print("(Headless Mode)")
+    improvements = []
+    if ENABLE_ENHANCE:
+        improvements.append("Image Enhancement")
+    if ENABLE_TEMPORAL:
+        improvements.append("Temporal Smoothing")
+    if improvements:
+        print(f"Enabled: {', '.join(improvements)}")
     print("=" * 60)
     
     # Check if model path exists
@@ -112,6 +307,9 @@ def main():
         print(f"✗ Failed to load model: {e}")
         sys.exit(1)
     
+    # Initialize temporal smoother if enabled
+    temporal_smoother = TemporalSmoother(max_frames=5, iou_threshold=0.5) if ENABLE_TEMPORAL else None
+    
     # Open the video file
     print(f"Opening video file: {VIDEO_PATH}")
     cap = cv2.VideoCapture(VIDEO_PATH)
@@ -126,6 +324,7 @@ def main():
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     
     print(f"Video properties: {frame_width}x{frame_height}, {fps:.2f} FPS, {total_frames} frames")
+    print(f"Confidence threshold: {CONFIDENCE_THRESHOLD}")
     
     # Set up video writer for output
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
@@ -152,10 +351,15 @@ def main():
         frame_count += 1
         start_time = time.perf_counter()
         
+        # Apply image enhancement if enabled
+        if ENABLE_ENHANCE:
+            frame = enhance_frame(frame)
+        
         # Convert frame to RGB (Ultralytics expects RGB)
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         
         # Run inference with the NCNN model
+        raw_detections = []
         try:
             results = model.predict(frame_rgb, verbose=False, conf=CONFIDENCE_THRESHOLD)
             
@@ -163,49 +367,51 @@ def main():
             if results and len(results) > 0:
                 detections = results[0].boxes
                 
-                # Draw detections on frame
+                # Convert to list of dicts for easier processing
                 for i in range(len(detections)):
-                    # Get bounding box coordinates
                     xyxy_tensor = detections[i].xyxy.cpu()
                     xyxy = xyxy_tensor.numpy().squeeze()
-                    xmin, ymin, xmax, ymax = xyxy.astype(int)
                     
                     # Ensure coordinates are within frame bounds
+                    xmin, ymin, xmax, ymax = xyxy.astype(int)
                     xmin, ymin = max(0, xmin), max(0, ymin)
                     xmax, ymax = min(frame_width, xmax), min(frame_height, ymax)
+                    xyxy = np.array([xmin, ymin, xmax, ymax])
                     
-                    # Get class ID and name
                     classidx = int(detections[i].cls.item())
                     classname = labels[classidx]
-                    
-                    # Get confidence
                     conf = detections[i].conf.item()
                     
-                    # Draw bounding box if confidence is high enough
                     if conf > CONFIDENCE_THRESHOLD:
-                        color = BBOX_COLORS[classidx % len(BBOX_COLORS)]
-                        cv2.rectangle(frame, (xmin, ymin), (xmax, ymax), color, 2)
-                        
-                        label = f'{classname}: {int(conf*100)}%'
-                        labelSize, baseLine = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-                        label_ymin = max(ymin, labelSize[1] + 10)
-                        
-                        # Draw label background
-                        cv2.rectangle(frame, (xmin, label_ymin-labelSize[1]-10), 
-                                    (xmin+labelSize[0], label_ymin+baseLine-10), color, cv2.FILLED)
-                        # Draw label text
-                        cv2.putText(frame, label, (xmin, label_ymin-7), 
-                                  cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
-                        
-                        total_detections += 1
-                        
-                        # Track class counts
-                        if classname not in class_counts:
-                            class_counts[classname] = 0
-                        class_counts[classname] += 1
-                        
+                        raw_detections.append({
+                            'xyxy': xyxy,
+                            'conf': conf,
+                            'cls': classidx,
+                            'classname': classname
+                        })
         except Exception as e:
             print(f"Error during inference on frame {frame_count}: {e}")
+        
+        # Apply temporal smoothing if enabled
+        if ENABLE_TEMPORAL and temporal_smoother:
+            smoothed_detections = temporal_smoother.update(raw_detections, frame_count)
+        else:
+            smoothed_detections = raw_detections
+        
+        # Draw smoothed detections on frame
+        for det in smoothed_detections:
+            xyxy = det['xyxy']
+            classname = det['classname']
+            conf = det['conf']
+            classidx = det['cls']
+            
+            color = BBOX_COLORS[classidx % len(BBOX_COLORS)]
+            draw_detection(frame, xyxy, classname, conf, color)
+            
+            total_detections += 1
+            if classname not in class_counts:
+                class_counts[classname] = 0
+            class_counts[classname] += 1
         
         # Calculate processing statistics
         processing_time = time.perf_counter() - start_time
@@ -220,19 +426,32 @@ def main():
         cv2.putText(frame, f'Detections: {total_detections}', (20, 90), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         
+        # Add enhancement/temporal indicators
+        status_y = 120
+        if ENABLE_ENHANCE:
+            cv2.putText(frame, 'Enhancement: ON', (20, status_y), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            status_y += 30
+        if ENABLE_TEMPORAL:
+            active_tracks = len(temporal_smoother.get_active_tracks()) if temporal_smoother else 0
+            cv2.putText(frame, f'Temporal: ON | Tracks: {active_tracks}', (20, status_y), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        
         # Write frame to output video
         if out.isOpened():
             out.write(frame)
         
         # Headless: Print progress periodically
         if HEADLESS and frame_count % 100 == 0:
+            active_tracks = len(temporal_smoother.get_active_tracks()) if temporal_smoother else 0
             print(f"Processed {frame_count}/{total_frames} frames | "
                   f"Detections: {total_detections} | "
+                  f"Tracks: {active_tracks} | "
                   f"Current FPS: {avg_fps:.2f}")
         
         # Interactive: Display frame and check for user input
         if not HEADLESS:
-            cv2.imshow('YOLO11n NCNN Video Inference', frame)
+            cv2.imshow('YOLO11n NCNN Video Inference with Improvements', frame)
             
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
@@ -278,6 +497,11 @@ def main():
         print(f"  Average processing time per frame: {avg_time:.2f} ms")
         print(f"  Min processing time: {min_time:.2f} ms")
         print(f"  Max processing time: {max_time:.2f} ms")
+    
+    if ENABLE_TEMPORAL and temporal_smoother:
+        active_tracks = len(temporal_smoother.get_active_tracks())
+        print(f"\nTemporal Smoothing:")
+        print(f"  Active tracks at end: {active_tracks}")
     
     print(f"\nOutput video saved to: {OUTPUT_PATH}")
     print("=" * 60)
