@@ -10,7 +10,7 @@ Usage:
     python video_inference_ncnn.py [--headless] [--model MODEL_PATH] [--video VIDEO_PATH]
                                     [--output OUTPUT_PATH] [--enhance] [--temporal]
                                     [--conf CONF] [--rpicam] [--width W] [--height H]
-                                    [--framerate FPS]
+                                    [--framerate FPS] [--stream] [--stream-port PORT]
 
 Examples:
     python video_inference_ncnn.py                          # Interactive mode with GUI
@@ -18,6 +18,8 @@ Examples:
     python video_inference_ncnn.py --video sample_vids/8170-207209141_small.mp4
     python video_inference_ncnn.py --headless --enhance --temporal  # Both improvements enabled
     python video_inference_ncnn.py --headless --rpicam       # Raspberry Pi camera via libcamera
+    python video_inference_ncnn.py --headless --ws-url ws://host:8080  # Stream detections via WebSocket
+    python video_inference_ncnn.py --headless --rpicam --stream        # Serve annotated frames as MJPEG
 """
 
 import argparse
@@ -28,6 +30,9 @@ from birds_cv import (
     DEFAULT_VIDEO_PATH,
     DEFAULT_OUTPUT_PATH,
     DEFAULT_CONFIDENCE_THRESHOLD,
+    DEFAULT_WS_URL,
+    DEFAULT_STREAM_HOST,
+    DEFAULT_STREAM_PORT,
 )
 
 
@@ -109,6 +114,38 @@ def parse_args():
         type=int,
         default=30,
         help='Camera framerate in fps (default: 30, used with --rpicam)'
+    )
+
+    parser.add_argument(
+        '--ws-url',
+        type=str,
+        default=None,
+        help=f'WebSocket server URL to stream detections to (e.g. {DEFAULT_WS_URL}). '
+             'When omitted, no WebSocket connection is made.'
+    )
+
+    parser.add_argument(
+        '--stream',
+        action='store_true',
+        help='Serve the annotated frames as a live MJPEG stream over HTTP while '
+             'inference runs (like start_stream.py). Pair with --headless to view '
+             'the pipeline remotely.'
+    )
+
+    parser.add_argument(
+        '--stream-host',
+        type=str,
+        default=DEFAULT_STREAM_HOST,
+        help=f'Host to bind the MJPEG stream server to (default: {DEFAULT_STREAM_HOST}, '
+             'used with --stream)'
+    )
+
+    parser.add_argument(
+        '--stream-port',
+        type=int,
+        default=DEFAULT_STREAM_PORT,
+        help=f'Port to serve the MJPEG stream on (default: {DEFAULT_STREAM_PORT}, '
+             'used with --stream)'
     )
 
     return parser.parse_args()

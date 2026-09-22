@@ -6,7 +6,7 @@ import subprocess
 import tempfile
 
 
-def start_rpicam_source(width=640, height=480, framerate=30):
+def start_rpicam_source(width=640, height=480, framerate=60):
     """
     Start the Raspberry Pi camera via the libcamera stack (rpicam-vid) and expose
     the live feed as an MJPEG stream on a named pipe that cv2.VideoCapture can read.

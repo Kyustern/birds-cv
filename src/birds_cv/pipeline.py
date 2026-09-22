@@ -2,6 +2,7 @@
 
 import os
 import sys
+import threading
 import time
 import atexit
 import subprocess
@@ -14,12 +15,17 @@ from .config import (
     BBOX_COLORS,
     DEFAULT_OUTPUT_PATH,
     DEFAULT_HEADLESS_OUTPUT_DIR,
+    DEFAULT_WS_URL,
 )
 from .tracker import TemporalSmoother
 from .enhance import enhance_frame
 from .drawing import draw_detection, draw_info_overlay
 from .camera import start_rpicam_source, stop_rpicam_source
+from .websocket_client import WebSocketEmitter
+from .stream_server import StreamServer, DEFAULT_STREAM_HOST, DEFAULT_STREAM_PORT
+from .frame_reader import LatestFrameReader
 
+PUBLISHER_INTERVAL = 5000
 
 def resolve_output_path(args):
     """
@@ -75,6 +81,28 @@ def extract_detections(results, labels, frame_width, frame_height, conf_threshol
             })
     return detections_out
 
+# def publisher_loop() :
+    # global heartbeat_active
+    
+    # while heartbeat_active:
+        # with heartbeat_lock:
+            # Getting the freshest prediction data
+            # print("publishing..")
+            # predictions = kalman_filter_service.get_latest_predictions()
+
+            # # Send heartbeat to all connected clients
+            # for sid in list(connected_clients):
+            #     socketio.emit('heartbeat', time.time(), room=sid)
+        
+        # Sleep for the heartbeat interval
+        # time.sleep(PUBLISHER_INTERVAL)
+    
+
+# publisher_thread= threading.Thread(
+#     target=publisher_loop,
+#     daemon=True,
+#     name="websocket-heartbeat",
+# )
 
 def run_inference(args):
     """Load the model and run the inference loop over the configured video source."""
@@ -121,6 +149,18 @@ def run_inference(args):
     # Initialize temporal smoother if enabled
     temporal_smoother = TemporalSmoother(max_frames=5, iou_threshold=0.5) if ENABLE_TEMPORAL else None
 
+    # Connect the WebSocket emitter (if a server URL was provided) before the
+    # inference loop starts, so per-frame detections can be streamed out.
+    print("args.ws_url", args.ws_url)
+
+    url = args.ws_url or DEFAULT_WS_URL
+    print("url", url)
+    ws_emitter = WebSocketEmitter(
+        url=url
+    )
+    if ws_emitter is not None:
+        ws_emitter.connect()
+
     # Open the video source: a file, or the Raspberry Pi camera via libcamera
     rpicam_proc = None
     if args.rpicam:
@@ -162,6 +202,10 @@ def run_inference(args):
     # Ensure the capture, writer, and rpicam-vid subprocess are cleaned up even when
     # the live stream is stopped with Ctrl-C or killed by a signal (otherwise the
     # output .mp4 is left without a moov atom and is unplayable).
+    # frame_reader is populated later for live streams; declared here so the
+    # cleanup closure always sees it bound.
+    frame_reader = None
+
     def _cleanup_source():
         try:
             cap.release()
@@ -172,7 +216,11 @@ def run_inference(args):
                 out.release()
             except Exception:
                 pass
+        if frame_reader is not None:
+            frame_reader.stop()
         stop_rpicam_source(rpicam_proc)
+        if ws_emitter is not None:
+            ws_emitter.close()
 
     atexit.register(_cleanup_source)
     try:
@@ -189,6 +237,17 @@ def run_inference(args):
     print("Starting video inference...")
     if not HEADLESS:
         print("Press 'q' to quit, 's' to pause, 'p' to save current frame")
+
+    # Optionally serve the annotated frames as a live MJPEG stream so the
+    # running pipeline can be viewed in a browser, mirroring start_stream.py.
+    stream_server = None
+    if getattr(args, 'stream', False):
+        stream_host = getattr(args, 'stream_host', DEFAULT_STREAM_HOST) or DEFAULT_STREAM_HOST
+        stream_port = getattr(args, 'stream_port', DEFAULT_STREAM_PORT)
+        stream_server = StreamServer(host=stream_host, port=stream_port)
+        stream_server.start()
+    if stream_server is not None:
+        print("Live annotated frames will be available at /stream and /snapshot")
     print("-" * 60)
 
     frame_count = 0
@@ -196,11 +255,31 @@ def run_inference(args):
     total_detections = 0
     class_counts = {}
 
-    # Main inference loop
+    inference_start = time.perf_counter()
+
+    # For a live camera source, read frames on a background thread that keeps
+    # only the newest frame. The inference loop then always runs on the freshest
+    # available frame and never falls behind processing a backlog of stale
+    # "lost" frames. Recorded files keep the sequential cap.read() so every
+    # frame is processed in order.
+    last_seq = 0
+    if live_stream:
+        frame_reader = LatestFrameReader(cap)
+        frame_reader.start()
+
+    # _ _ _ _ _ _ _ _ _ _ Main inference loop _ _ _ _ _ _ _ _ _ _
     while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            break
+        if frame_reader is not None:
+            seq, frame = frame_reader.next_fresh(last_seq)
+            if frame is None:
+                break
+            last_seq = seq
+        else:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+        frame = cv2.flip(frame, 0)
 
         # For a live camera pipe the CAP properties are unknown, so derive frame
         # dimensions from the frame itself (before inference uses them) and lazily
@@ -214,7 +293,7 @@ def run_inference(args):
                     out = None
 
         frame_count += 1
-        start_time = time.perf_counter()
+        frame_start = time.perf_counter()
 
         # Apply image enhancement if enabled
         if ENABLE_ENHANCE:
@@ -239,6 +318,10 @@ def run_inference(args):
         else:
             smoothed_detections = raw_detections
 
+        # Stream detections to the WebSocket server (bounding boxes + center points)
+        if ws_emitter is not None:
+            ws_emitter.emit_detections(smoothed_detections, frame_count)
+
         # Draw smoothed detections on frame
         for det in smoothed_detections:
             xyxy = det['xyxy']
@@ -255,7 +338,7 @@ def run_inference(args):
             class_counts[classname] += 1
 
         # Calculate processing statistics
-        processing_time = time.perf_counter() - start_time
+        processing_time = time.perf_counter() - frame_start
         processing_times.append(processing_time)
         avg_fps = len(processing_times) / sum(processing_times) if processing_times else 0
 
@@ -268,14 +351,20 @@ def run_inference(args):
         if out is not None and out.isOpened():
             out.write(frame)
 
+        # Push the annotated frame to the live MJPEG stream (if enabled)
+        if stream_server is not None:
+            stream_server.update_frame(frame)
+
         # Headless: Print progress periodically
-        if HEADLESS and frame_count % 100 == 0:
+        if HEADLESS and frame_count % 10 == 0:
             progress = f'{frame_count} frames' if live_stream else f'{frame_count}/{total_frames} frames'
             print(f"Processed {progress} | "
                   f"Detections: {total_detections} | "
                   f"Tracks: {active_tracks} | "
                   f"Current FPS: {avg_fps:.2f}")
 
+        # end_time = time.perf_counter()
+        
         # Interactive: Display frame and check for user input
         if not HEADLESS:
             cv2.imshow('YOLO11n NCNN Video Inference with Improvements', frame)
@@ -298,7 +387,11 @@ def run_inference(args):
     cap.release()
     if out is not None:
         out.release()
+    if frame_reader is not None:
+        frame_reader.stop()
     stop_rpicam_source(rpicam_proc)
+    if ws_emitter is not None:
+        ws_emitter.close()
 
     if not HEADLESS:
         cv2.destroyAllWindows()

@@ -14,3 +14,7 @@ BBOX_COLORS = [
 
 # Default detection parameters
 DEFAULT_CONFIDENCE_THRESHOLD = 0.5
+
+# WebSocket server for streaming detections (opt-in via --ws-url)
+DEFAULT_WS_URL = 'http://localhost:5000/'
+
